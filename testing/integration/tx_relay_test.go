@@ -2,11 +2,7 @@ package integration
 
 import (
 	"encoding/hex"
-	"strings"
 	"testing"
-	"time"
-
-	"github.com/spectre-project/spectred/app/protocol/flowcontext"
 
 	"github.com/spectre-project/spectred/domain/consensus/utils/utxo"
 
@@ -15,131 +11,180 @@ import (
 	"github.com/spectre-project/spectred/domain/consensus/model/externalapi"
 	"github.com/spectre-project/spectred/domain/consensus/utils/consensushashing"
 	"github.com/spectre-project/spectred/domain/consensus/utils/constants"
-	"github.com/spectre-project/spectred/domain/consensus/utils/transactionhelper"
+	"github.com/spectre-project/spectred/domain/consensus/utils/transactionid"
 	"github.com/spectre-project/spectred/domain/consensus/utils/txscript"
 	"github.com/spectre-project/spectred/util"
 )
 
-func TestTxRelay(t *testing.T) {
-	payer, mediator, payee, teardown := standardSetup(t)
+func TestUTXOIndex(t *testing.T) {
+	// Setup a single spectred instance
+	harnessParams := &harnessParams{
+		p2pAddress:              p2pAddress1,
+		rpcAddress:              rpcAddress1,
+		miningAddress:           miningAddress1,
+		miningAddressPrivateKey: miningAddress1PrivateKey,
+		utxoIndex:               true,
+	}
+	spectred, teardown := setupHarness(t, harnessParams)
 	defer teardown()
 
-	// Connect nodes in chain: payer <--> mediator <--> payee
-	// So that payee doesn't directly get transactions from payer
-	connect(t, payer, mediator)
-	connect(t, mediator, payee)
+	// skip the first block because it's paying to genesis script,
+	// which contains no outputs
+	mineNextBlock(t, spectred)
 
-	payeeBlockAddedChan := make(chan *appmessage.RPCBlockHeader)
-	setOnBlockAddedHandler(t, payee, func(notification *appmessage.BlockAddedNotificationMessage) {
-		payeeBlockAddedChan <- notification.Block.Header
+	// Register for UTXO changes
+	const blockAmountToMine = 100
+	onUTXOsChangedChan := make(chan *appmessage.UTXOsChangedNotificationMessage, blockAmountToMine)
+	err := spectred.rpcClient.RegisterForUTXOsChangedNotifications([]string{miningAddress1}, func(
+		notification *appmessage.UTXOsChangedNotificationMessage) {
+
+		onUTXOsChangedChan <- notification
 	})
-	// skip the first block because it's paying to genesis script
-	mineNextBlock(t, payer)
-	waitForPayeeToReceiveBlock(t, payeeBlockAddedChan)
-	// use the second block to get money to pay with
-	secondBlock := mineNextBlock(t, payer)
-	waitForPayeeToReceiveBlock(t, payeeBlockAddedChan)
-
-	// Mine BlockCoinbaseMaturity more blocks for our money to mature
-	for i := uint64(0); i < payer.config.ActiveNetParams.BlockCoinbaseMaturity; i++ {
-		mineNextBlock(t, payer)
-		waitForPayeeToReceiveBlock(t, payeeBlockAddedChan)
-	}
-
-	// Sleep for `TransactionIDPropagationInterval` to make sure that our transaction will
-	// be propagated
-	time.Sleep(flowcontext.TransactionIDPropagationInterval)
-
-	msgTx := generateTx(t, secondBlock.Transactions[transactionhelper.CoinbaseTransactionIndex], payer, payee)
-	domainTransaction := appmessage.MsgTxToDomainTransaction(msgTx)
-	rpcTransaction := appmessage.DomainTransactionToRPCTransaction(domainTransaction)
-	response, err := payer.rpcClient.SubmitTransaction(rpcTransaction, false)
 	if err != nil {
-		t.Fatalf("Error submitting transaction: %+v", err)
+		t.Fatalf("Failed to register for UTXO change notifications: %s", err)
 	}
-	txID := response.TransactionID
 
-	txAddedToMempoolChan := make(chan struct{})
+	// Mine some blocks
+	for i := 0; i < blockAmountToMine; i++ {
+		mineNextBlock(t, spectred)
+	}
 
-	mempoolAddressQuery := []string{payee.miningAddress, payer.miningAddress}
+	//check if rewards corrosponds to circulating supply.
+	getCoinSupplyResponse, err := spectred.rpcClient.GetCoinSupply()
+	if err != nil {
+		t.Fatalf("Error Retriving Coin supply: %s", err)
+	}
 
-	spawn("TestTxRelay-WaitForTransactionPropagation", func() {
-		ticker := time.NewTicker(10 * time.Millisecond)
-		defer ticker.Stop()
+	rewardsMinedSompi := uint64(blockAmountToMine * constants.SompiPerSpectre * 500)
+	getBlockCountResponse, err := spectred.rpcClient.GetBlockCount()
+	if err != nil {
+		t.Fatalf("Error Retriving BlockCount: %s", err)
+	}
+	rewardsMinedViaBlockCountSompi := uint64(
+		(getBlockCountResponse.BlockCount - 2) * constants.SompiPerSpectre * 500, // -2 because of genesis and virtual.
+	)
 
-		for range ticker.C {
+	if getCoinSupplyResponse.CirculatingSompi != rewardsMinedSompi {
+		t.Fatalf("Error: Circulating supply Mismatch - Circulating Sompi: %d Sompi Mined: %d", getCoinSupplyResponse.CirculatingSompi, rewardsMinedSompi)
+	} else if getCoinSupplyResponse.CirculatingSompi != rewardsMinedViaBlockCountSompi {
+		t.Fatalf("Error: Circulating supply Mismatch - Circulating Sompi: %d Sompi Mined via Block count: %d", getCoinSupplyResponse.CirculatingSompi, rewardsMinedViaBlockCountSompi)
+	}
 
-			getMempoolEntryResponse, err := payee.rpcClient.GetMempoolEntry(txID, true, false)
-			if err != nil {
-				if strings.Contains(err.Error(), "not found") {
-					continue
-				}
-
-				t.Fatalf("Error getting mempool entry: %+v", err)
-			}
-			mempoolEntry := getMempoolEntryResponse.Entry
-			if mempoolEntry.IsOrphan {
-				t.Fatalf("transaction %s is an orphan, although it shouldn't be", mempoolEntry.Transaction.VerboseData.TransactionID)
-			}
-
-			getMempoolEntriesByAddressesResponse, err := payee.rpcClient.GetMempoolEntriesByAddresses(mempoolAddressQuery, true, false)
-			if err != nil {
-				t.Fatalf("Error getting mempool entry: %+v", err)
-			}
-			for _, mempoolEntryByAddress := range getMempoolEntriesByAddressesResponse.Entries {
-				if payee.miningAddress == mempoolEntryByAddress.Address {
-					if len(mempoolEntryByAddress.Sending) > 1 {
-						t.Fatal("Error payee is sending")
-					}
-					if len(mempoolEntryByAddress.Receiving) < 1 {
-						t.Fatal("Error payee is not reciving")
-					}
-				}
-				if payer.miningAddress == mempoolEntryByAddress.Address {
-					if len(mempoolEntryByAddress.Sending) < 1 {
-						t.Fatal("Error payer is not sending")
-					}
-					if len(mempoolEntryByAddress.Receiving) > 1 {
-						t.Fatal("Error payer is reciving")
-					}
-				}
-				for _, mempoolEntry := range mempoolEntryByAddress.Receiving {
-					if mempoolEntry.IsOrphan {
-						t.Fatalf("transaction %s is an orphan, although it shouldn't be", mempoolEntry.Transaction.VerboseData.TransactionID)
-					}
-				}
-				for _, mempoolEntry := range mempoolEntryByAddress.Sending {
-					if mempoolEntry.IsOrphan {
-						t.Fatalf("transaction %s is an orphan, although it shouldn't be", mempoolEntry.Transaction.VerboseData.TransactionID)
-					}
-				}
-			}
-
-			close(txAddedToMempoolChan)
-			return
+	// Collect the UTXO and make sure there's nothing in Removed
+	// Note that we expect blockAmountToMine-1 messages because
+	// the last block won't be accepted until the next block is
+	// mined
+	var notificationEntries []*appmessage.UTXOsByAddressesEntry
+	for i := 0; i < blockAmountToMine; i++ {
+		notification := <-onUTXOsChangedChan
+		if len(notification.Removed) > 0 {
+			t.Fatalf("Unexpectedly received that a UTXO has been removed")
 		}
-	})
+		for _, added := range notification.Added {
+			notificationEntries = append(notificationEntries, added)
+		}
+	}
 
-	select {
-	case <-txAddedToMempoolChan:
-	case <-time.After(defaultTimeout):
-		t.Fatalf("Timeout waiting for transaction to be accepted into mempool")
+	// Submit a few transactions that spends some UTXOs
+	const transactionAmountToSpend = 5
+	for i := 0; i < transactionAmountToSpend; i++ {
+		rpcTransaction, transactionID := buildTransactionForUTXOIndexTest(t, notificationEntries[i])
+		_, err = spectred.rpcClient.SubmitTransaction(rpcTransaction, transactionID, false)
+		if err != nil {
+			t.Fatalf("Error submitting transaction: %s", err)
+		}
+	}
+
+	// Mine a block to include the above transactions
+	mineNextBlock(t, spectred)
+
+	// Make sure this block removed the UTXOs we spent
+	notification := <-onUTXOsChangedChan
+	if len(notification.Removed) != transactionAmountToSpend {
+		t.Fatalf("Unexpected amount of removed UTXOs. Want: %d, got: %d",
+			transactionAmountToSpend, len(notification.Removed))
+	}
+	for i := 0; i < transactionAmountToSpend; i++ {
+		entry := notificationEntries[i]
+
+		found := false
+		for _, removed := range notification.Removed {
+			if *removed.Outpoint == *entry.Outpoint {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("Missing entry amongst removed UTXOs: %s:%d",
+				entry.Outpoint.TransactionID, entry.Outpoint.Index)
+		}
+	}
+	for _, added := range notification.Added {
+		notificationEntries = append(notificationEntries, added)
+	}
+
+	// Remove the UTXOs we spent from `notificationEntries`
+	notificationEntries = notificationEntries[transactionAmountToSpend:]
+
+	// Get all the UTXOs and make sure the response is equivalent
+	// to the data collected via notifications
+	utxosByAddressesResponse, err := spectred.rpcClient.GetUTXOsByAddresses([]string{miningAddress1})
+	if err != nil {
+		t.Fatalf("Failed to get UTXOs: %s", err)
+	}
+	if len(notificationEntries) != len(utxosByAddressesResponse.Entries) {
+		t.Fatalf("Unexpected amount of UTXOs. Want: %d, got: %d",
+			len(notificationEntries), len(utxosByAddressesResponse.Entries))
+	}
+	for _, notificationEntry := range notificationEntries {
+		var foundResponseEntry *appmessage.UTXOsByAddressesEntry
+		for _, responseEntry := range utxosByAddressesResponse.Entries {
+			if *notificationEntry.Outpoint == *responseEntry.Outpoint {
+				foundResponseEntry = responseEntry
+				break
+			}
+		}
+		if foundResponseEntry == nil {
+			t.Fatalf("Missing entry in UTXOs response: %s:%d",
+				notificationEntry.Outpoint.TransactionID, notificationEntry.Outpoint.Index)
+		}
+		if notificationEntry.UTXOEntry.Amount != foundResponseEntry.UTXOEntry.Amount {
+			t.Fatalf("Unexpected UTXOEntry for outpoint %s:%d. Want: %+v, got: %+v",
+				notificationEntry.Outpoint.TransactionID, notificationEntry.Outpoint.Index,
+				notificationEntry.UTXOEntry, foundResponseEntry.UTXOEntry)
+		}
+		if notificationEntry.UTXOEntry.BlockDAAScore != foundResponseEntry.UTXOEntry.BlockDAAScore {
+			t.Fatalf("Unexpected UTXOEntry for outpoint %s:%d. Want: %+v, got: %+v",
+				notificationEntry.Outpoint.TransactionID, notificationEntry.Outpoint.Index,
+				notificationEntry.UTXOEntry, foundResponseEntry.UTXOEntry)
+		}
+		if notificationEntry.UTXOEntry.IsCoinbase != foundResponseEntry.UTXOEntry.IsCoinbase {
+			t.Fatalf("Unexpected UTXOEntry for outpoint %s:%d. Want: %+v, got: %+v",
+				notificationEntry.Outpoint.TransactionID, notificationEntry.Outpoint.Index,
+				notificationEntry.UTXOEntry, foundResponseEntry.UTXOEntry)
+		}
+		if *notificationEntry.UTXOEntry.ScriptPublicKey != *foundResponseEntry.UTXOEntry.ScriptPublicKey {
+			t.Fatalf("Unexpected UTXOEntry for outpoint %s:%d. Want: %+v, got: %+v",
+				notificationEntry.Outpoint.TransactionID, notificationEntry.Outpoint.Index,
+				notificationEntry.UTXOEntry, foundResponseEntry.UTXOEntry)
+		}
 	}
 }
 
-func waitForPayeeToReceiveBlock(t *testing.T, payeeBlockAddedChan chan *appmessage.RPCBlockHeader) {
-	select {
-	case <-payeeBlockAddedChan:
-	case <-time.After(defaultTimeout):
-		t.Fatalf("Timeout waiting for block added")
+func buildTransactionForUTXOIndexTest(t *testing.T, entry *appmessage.UTXOsByAddressesEntry) (*appmessage.RPCTransaction, string) {
+	transactionIDBytes, err := hex.DecodeString(entry.Outpoint.TransactionID)
+	if err != nil {
+		t.Fatalf("Error decoding transaction ID: %s", err)
 	}
-}
+	transactionID, err := transactionid.FromBytes(transactionIDBytes)
+	if err != nil {
+		t.Fatalf("Error decoding transaction ID: %s", err)
+	}
 
-func generateTx(t *testing.T, firstBlockCoinbase *externalapi.DomainTransaction, payer, payee *appHarness) *appmessage.MsgTx {
 	txIns := make([]*appmessage.TxIn, 1)
-	txIns[0] = appmessage.NewTxIn(appmessage.NewOutpoint(consensushashing.TransactionID(firstBlockCoinbase), 0), []byte{}, 0, 1)
+	txIns[0] = appmessage.NewTxIn(appmessage.NewOutpoint(transactionID, entry.Outpoint.Index), []byte{}, 0, 1)
 
-	payeeAddress, err := util.DecodeAddress(payee.miningAddress, util.Bech32PrefixSpectreSim)
+	payeeAddress, err := util.DecodeAddress(miningAddress1, util.Bech32PrefixSpectreSim)
 	if err != nil {
 		t.Fatalf("Error decoding payeeAddress: %+v", err)
 	}
@@ -148,11 +193,18 @@ func generateTx(t *testing.T, firstBlockCoinbase *externalapi.DomainTransaction,
 		t.Fatalf("Error generating script: %+v", err)
 	}
 
-	txOuts := []*appmessage.TxOut{appmessage.NewTxOut(firstBlockCoinbase.Outputs[0].Value-1000, toScript)}
+	txOuts := []*appmessage.TxOut{appmessage.NewTxOut(entry.UTXOEntry.Amount-1000, toScript)}
+
+	fromScriptCode, err := hex.DecodeString(entry.UTXOEntry.ScriptPublicKey.Script)
+	if err != nil {
+		t.Fatalf("Error decoding script public key: %s", err)
+	}
+	fromScript := &externalapi.ScriptPublicKey{Script: fromScriptCode, Version: 0}
+	fromAmount := entry.UTXOEntry.Amount
 
 	msgTx := appmessage.NewNativeMsgTx(constants.MaxTransactionVersion, txIns, txOuts)
 
-	privateKeyBytes, err := hex.DecodeString(payer.miningAddressPrivateKey)
+	privateKeyBytes, err := hex.DecodeString(miningAddress1PrivateKey)
 	if err != nil {
 		t.Fatalf("Error decoding private key: %+v", err)
 	}
@@ -161,11 +213,9 @@ func generateTx(t *testing.T, firstBlockCoinbase *externalapi.DomainTransaction,
 		t.Fatalf("Error deserializing private key: %+v", err)
 	}
 
-	fromScript := firstBlockCoinbase.Outputs[0].ScriptPublicKey
-	fromAmount := firstBlockCoinbase.Outputs[0].Value
-
 	tx := appmessage.MsgTxToDomainTransaction(msgTx)
 	tx.Inputs[0].UTXOEntry = utxo.NewUTXOEntry(fromAmount, fromScript, false, 500)
+
 	signatureScript, err := txscript.SignatureScript(tx, 0, consensushashing.SigHashAll, privateKey,
 		&consensushashing.SighashReusedValues{})
 	if err != nil {
@@ -173,5 +223,6 @@ func generateTx(t *testing.T, firstBlockCoinbase *externalapi.DomainTransaction,
 	}
 	msgTx.TxIn[0].SignatureScript = signatureScript
 
-	return msgTx
+	domainTransaction := appmessage.MsgTxToDomainTransaction(msgTx)
+	return appmessage.DomainTransactionToRPCTransaction(domainTransaction), consensushashing.TransactionID(domainTransaction).String()
 }
