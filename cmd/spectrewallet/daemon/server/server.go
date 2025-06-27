@@ -32,7 +32,7 @@ type server struct {
 	rpcClient           *rpcclient.RPCClient // RPC client for ongoing user requests
 	backgroundRPCClient *rpcclient.RPCClient // RPC client dedicated for address and UTXO background fetching
 	params              *dagconfig.Params
-	coinbaseMaturity    uint64 // Is different from default if we use testnet-11
+	coinbaseMaturity    uint64 // Different from go-spectred default following Sigma hf
 
 	lock                            sync.RWMutex
 	utxosSortedByAmount             []*walletUTXO
@@ -96,14 +96,8 @@ func Start(params *dagconfig.Params, listen, rpcServer string, keysFilePath stri
 		return err
 	}
 
-	dagInfo, err := rpcClient.GetBlockDAGInfo()
-	if err != nil {
-		return nil
-	}
-	coinbaseMaturity := params.BlockCoinbaseMaturity
-	if dagInfo.NetworkName == "spectre-testnet-1" {
-		coinbaseMaturity = 1000
-	}
+	// Post-Sigma coinbase maturity
+	coinbaseMaturity := uint64(800)
 
 	serverInstance := &server{
 		rpcClient:                   rpcClient,
